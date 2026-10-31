@@ -62,6 +62,7 @@ Tools:
 | `activate_pane` / `activate_tab` | bring something to the front |
 | `set_tab_title` | rename a tab |
 | `kill_pane` | close a pane |
+| `report_friction` | file a pain point with Steg itself as a GitHub issue (see below) |
 
 Resources: `wezterm://pane/{pane_id}/screen` and
 `wezterm://pane/{pane_id}/scrollback`, plus one listed resource per live pane.
@@ -76,6 +77,31 @@ and a plain-language message, so it reaches the model as text in any
 client. Only resource reads use protocol-level errors, because MCP gives
 them no other channel.
 
+## Friction reports
+
+When Steg gets in the agent's way — a tool misbehaves, a capability is
+missing, a description misled it — the agent calls `report_friction` and
+the pain point lands as a GitHub issue, labelled `friction` plus a category
+(`bug`, `missing-capability`, `confusing`, `docs`), with the context a
+maintainer needs attached automatically: Steg and OS versions, the last 25
+tool calls (names, numeric arguments and outcomes — never typed text), and,
+if the agent passes `pane_id`, that pane's screen. A report whose title
+matches an open issue becomes a comment on it instead of a duplicate.
+
+Issues are filed through the GitHub CLI (`gh api`, REST only), which owns
+the credentials: run `gh auth login` once, or set `GH_TOKEN`. Steg stores
+nothing. If `gh` is missing, unauthorized, or the repo has Issues turned
+off (forks start that way — enable them under Settings → Features), the
+report is saved under the local data directory (`steg/friction/*.md`) and
+the agent is told where and why.
+
+Flags: `--friction-repo OWNER/REPO` (default `$STEG_FRICTION_REPO`, else
+`shannonarcher/steg`), `--no-friction` to remove the tool. Env for odd
+setups: `STEG_GH_BIN`, `STEG_FRICTION_DIR`.
+
+Reports go wherever the repo is visible, so the tool description tells the
+agent not to put secrets in them.
+
 ## Tests
 
 ```sh
@@ -85,8 +111,9 @@ cargo test -p steg
 
 Unit tests cover key and URI parsing. `tests/mcp_surface.rs` drives the
 server through a real MCP client in-process, with no terminal present, and
-pins down the handshake, tool schemas, resources and error texts.
-`tests/e2e_mux.rs` runs the built `steg` binary against a headless
+pins down the handshake, tool schemas, resources and error texts, and
+runs `report_friction` against a fake `gh` (created, commented, saved
+locally, switched off). `tests/e2e_mux.rs` runs the built `steg` binary against a headless
 `wezterm-mux-server` over the real mux protocol — the same path as the GUI —
 and exercises every tool against a live bash. See `QA.md` for the manual
 checklist against a real window.
@@ -99,6 +126,7 @@ steg/src/lib.rs         the library the binary and the tests share
 steg/src/server.rs      MCP tools, resources, instructions (rmcp)
 steg/src/backend.rs     the wezterm codec: everything `wezterm cli` can do, as async fns
 steg/src/keys.rs        "CTRL|c", "Escape", "F5" → key events
+steg/src/friction.rs    report_friction: issue body, dedup, gh api calls, local fallback
 steg/tests/mcp_surface.rs   MCP client ↔ server in-process, no terminal
 steg/tests/e2e_mux.rs       the binary against a headless wezterm-mux-server
 steg/QA.md              automated layers + manual checklist for the GUI

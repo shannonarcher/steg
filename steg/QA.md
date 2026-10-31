@@ -24,6 +24,10 @@ Three layers:
    schemas and docs, resource templates, and that every failure is a clean
    tool error the agent can read: "start WezTerm", "unknown key", "side
    must be…". Also checks the connection survives malformed calls.
+   `report_friction` runs against a stand-in `gh` that answers like the
+   GitHub REST API: a new issue gets the right title, labels and body
+   (context, recent calls, screen); a matching open issue gets a comment;
+   no `gh` means a local file; `--no-friction` removes the tool.
 3. **End-to-end** (`tests/e2e_mux.rs`): the built `steg` binary drives a
    headless `wezterm-mux-server` over the real mux protocol, the same path
    used for `wezterm-gui`. Spawns bash in a new tab, types a command, waits
@@ -79,10 +83,19 @@ Tick these off on each platform, Windows first.
 - [ ] `wezterm://pane/{id}/screen` resource shows up in the Inspector's resource list and reads correctly.
 - [ ] Type into a pane yourself while the agent reads it: both see the same screen; nothing crashes when you close a pane the agent is using (the next call reports "pane N does not exist").
 
+**Friction reports**
+- [ ] Issues are enabled on the repo (Settings → Features; forks start with them off).
+- [ ] `gh auth status` is green, then `report_friction` from the Inspector creates an issue labelled `friction` + category, with the recent-calls table filled in.
+- [ ] Same title again → a comment on the existing issue, not a new one.
+- [ ] With `pane_id`, the screen appears in a collapsed block; without it, no screen.
+- [ ] Log out of `gh` → the reply says to run `gh auth login` and names the local `.md` file it saved instead.
+- [ ] `steg --no-friction` → the tool is absent from the list.
+
 **Windows specifics**
 - [ ] GUI discovery works over the named pipe (`steg` finds the running GUI with no flags).
 - [ ] Non-ASCII in `send_text` (`"héllo → 世界"`) arrives intact in PowerShell and in Claude Code.
 - [ ] A `cwd` that doesn't exist gives an error rather than a silent default.
+- [ ] `gh.exe` on PATH is found by `report_friction`; the local fallback lands under `%LOCALAPPDATA%\steg\friction`.
 
 ## Not yet covered
 

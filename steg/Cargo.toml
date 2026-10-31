@@ -21,12 +21,14 @@ anyhow.workspace = true
 clap.workspace = true
 codec.workspace = true
 config.workspace = true
+dirs-next.workspace = true
 env-bootstrap.workspace = true
 log.workspace = true
 mux.workspace = true
 portable-pty.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 termwiz.workspace = true
 termwiz-funcs.workspace = true
 wezterm-client.workspace = true
@@ -36,12 +38,11 @@ wezterm-term.workspace = true
 # MCP
 rmcp = { version = "3.8", features = ["server", "macros", "transport-io"] }
 schemars = "1.0"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-std"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-std", "process"] }
 
 [dev-dependencies]
 # The tests drive the server through a real MCP client: in-process over a
 # duplex pipe, and end-to-end as a child process against a headless
 # wezterm-mux-server.
 rmcp = { version = "3.8", features = ["client", "transport-child-process"] }
-tempfile.workspace = true
-tokio = { workspace = true, features = ["process", "io-util", "fs"] }
+tokio = { workspace = true, features = ["io-util", "fs"] }

@@ -5,23 +5,29 @@
 //! `Backend` operations and formats the answers.
 
 use crate::backend::{Backend, IdleResult, PaneInfo, SpawnTab, Spawned, Split, SplitSide};
+use crate::friction::{
+    summarize_args, CallRecord, Category, FrictionConfig, FrictionOutcome, FrictionReport,
+    FrictionReporter, RecentCalls,
+};
 use crate::keys::parse_key_event;
 use mux::pane::PaneId;
 use mux::tab::TabId;
 use mux::window::WindowId;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
-    Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceTemplate, ServerCapabilities, ServerConfig,
+    CallToolRequestParams, CallToolResponse, Implementation, ListResourceTemplatesResult,
+    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, ServerCapabilities,
+    ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const INSTRUCTIONS: &str = "\
 Steg exposes a live WezTerm terminal to you. Everything you do happens in the \
@@ -40,13 +46,23 @@ Typical flow:
    The same content is available as the resource wezterm://pane/{pane_id}/screen.
 
 Prefer working in tabs you created and leave the human's own panes alone \
-unless asked. Pane ids are stable for the life of the pane.";
+unless asked. Pane ids are stable for the life of the pane.
+
+If Steg itself gets in your way — a tool misbehaves, you need something it \
+can't do, a description misled you — call report_friction. It files a GitHub \
+issue with context so it gets fixed. Never put secrets in a report.";
 
 #[derive(Clone)]
 pub struct Steg {
     backend: Arc<Backend>,
     tool_router: ToolRouter<Self>,
+    friction: Arc<FrictionReporter>,
+    /// The last tool calls, attached to friction reports so a maintainer
+    /// can see what led up to the problem.
+    recent: Arc<RecentCalls>,
 }
+
+const RECENT_CALLS: usize = 25;
 
 /// Errors from resource reads have to be protocol errors; MCP gives them no
 /// other channel.
@@ -181,6 +197,28 @@ pub struct SetTabTitleParams {
     pub title: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReportFrictionParams {
+    /// One line naming the problem, e.g. "wait_for_idle returns before
+    /// Claude Code has finished streaming". Reports with the same title are
+    /// merged into one issue.
+    pub title: String,
+    /// What you were trying to do, what happened, and why it got in your
+    /// way. Markdown is fine. No secrets: the repo may be public.
+    pub details: String,
+    /// bug (a tool did the wrong thing), missing-capability (no tool for
+    /// what you needed), confusing (a description misled you), docs, other.
+    #[serde(default)]
+    pub category: Category,
+    /// The tool involved, if one.
+    pub tool: Option<String>,
+    /// What you expected to happen instead.
+    pub expected: Option<String>,
+    /// Attach the current screen of this pane to the report. Only if it
+    /// shows nothing secret.
+    pub pane_id: Option<PaneId>,
+}
+
 /// `list_panes` result. MCP structured content must be an object, so the
 /// array is wrapped.
 #[derive(Debug, Serialize, JsonSchema)]
@@ -194,11 +232,24 @@ pub struct PaneList {
 
 #[tool_router]
 impl Steg {
-    pub fn new(backend: Backend) -> Self {
+    /// `friction: None` removes the `report_friction` tool entirely.
+    pub fn new(backend: Backend, friction: Option<FrictionConfig>) -> Self {
+        let tool_router = match &friction {
+            Some(_) => Self::tool_router(),
+            None => Self::tool_router().with_disabled("report_friction"),
+        };
+        let friction = friction.unwrap_or_else(|| FrictionConfig::defaults(None));
         Self {
             backend: Arc::new(backend),
-            tool_router: Self::tool_router(),
+            tool_router,
+            friction: Arc::new(FrictionReporter::new(friction)),
+            recent: Arc::new(RecentCalls::new(RECENT_CALLS)),
         }
+    }
+
+    /// The repo friction reports go to.
+    pub fn friction_repo(&self) -> &str {
+        self.friction.repo()
     }
 
     #[tool(
@@ -384,6 +435,32 @@ impl Steg {
         self.backend.kill_pane(p.pane_id).await.map_err(tool_err)?;
         Ok(format!("pane {} closed", p.pane_id))
     }
+
+    #[tool(
+        description = "Report a pain point with Steg itself as a GitHub issue: a tool that misbehaved, something you needed and couldn't do, a description that misled you. Versions and your recent tool calls are attached automatically; pass pane_id to attach that pane's screen. Use it when Steg gets in your way, not for problems in the programs you are driving."
+    )]
+    async fn report_friction(
+        &self,
+        Parameters(p): Parameters<ReportFrictionParams>,
+    ) -> Result<Json<FrictionOutcome>, String> {
+        let screen = match p.pane_id {
+            Some(pane_id) => match self.backend.get_text(pane_id, None, None, false).await {
+                Ok(text) => Some((pane_id, text)),
+                Err(err) => Some((pane_id, format!("<could not read pane {pane_id}: {err:#}>"))),
+            },
+            None => None,
+        };
+        let report = FrictionReport {
+            title: p.title,
+            details: p.details,
+            category: p.category,
+            tool: p.tool,
+            expected: p.expected,
+            screen,
+            recent_calls: self.recent.snapshot(),
+        };
+        Ok(Json(self.friction.file(&report).await))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +484,45 @@ fn parse_pane_uri(uri: &str) -> Option<(PaneId, &str)> {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Steg {
+    /// Same dispatch the macro would generate, plus a note in the call log
+    /// that `report_friction` attaches to issues.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let tool = request.name.to_string();
+        let args = summarize_args(request.arguments.as_ref());
+        let started = Instant::now();
+
+        let result = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await;
+
+        if tool != "report_friction" {
+            let (ok, note) = match &result {
+                Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) => (
+                    false,
+                    r.content
+                        .iter()
+                        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+                        .unwrap_or_default(),
+                ),
+                Ok(_) => (true, String::new()),
+                Err(e) => (false, e.message.to_string()),
+            };
+            self.recent.push(CallRecord {
+                tool,
+                args,
+                ok,
+                ms: started.elapsed().as_millis() as u64,
+                note: note.chars().take(160).collect(),
+            });
+        }
+        result
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
             ServerCapabilities::builder()

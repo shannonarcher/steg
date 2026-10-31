@@ -10,7 +10,7 @@ use clap::{Parser, ValueHint};
 use config::wezterm_version;
 use rmcp::ServiceExt;
 use std::ffi::OsString;
-use steg::{Backend, ConnectOptions, Steg};
+use steg::{Backend, ConnectOptions, FrictionConfig, Steg};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,6 +46,15 @@ struct Opt {
     /// you to start WezTerm instead.
     #[arg(long)]
     auto_start: bool,
+
+    /// GitHub repo (owner/repo) that `report_friction` files issues to.
+    /// Defaults to $STEG_FRICTION_REPO, else the Steg repo itself.
+    #[arg(long, value_name = "OWNER/REPO")]
+    friction_repo: Option<String>,
+
+    /// Remove the `report_friction` tool, so the agent cannot file issues.
+    #[arg(long)]
+    no_friction: bool,
 }
 
 fn main() {
@@ -80,9 +89,20 @@ fn run() -> anyhow::Result<()> {
         .build()
         .context("creating tokio runtime")?;
 
+    let friction = if opts.no_friction {
+        None
+    } else {
+        Some(FrictionConfig::defaults(opts.friction_repo.clone()))
+    };
+
     runtime.block_on(async move {
         let backend = Backend::new(connect, config);
-        let server = Steg::new(backend);
+        let server = Steg::new(backend, friction);
+        if opts.no_friction {
+            log::info!("report_friction is disabled");
+        } else {
+            log::info!("report_friction files issues to {}", server.friction_repo());
+        }
 
         log::info!("steg {} serving MCP over stdio", wezterm_version());
         let running = server

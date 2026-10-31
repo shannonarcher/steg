@@ -12,7 +12,7 @@ use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Map, Value};
 use std::sync::OnceLock;
-use steg::{Backend, ConnectOptions, Steg};
+use steg::{Backend, ConnectOptions, FrictionConfig, Steg};
 
 /// Point wezterm at a socket that cannot exist, so that connecting fails
 /// fast and deterministically whatever is installed on this machine.
@@ -29,6 +29,15 @@ type Client = RunningService<RoleClient, ()>;
 
 /// Start a `Steg` server and an MCP client joined by an in-memory pipe.
 async fn connect() -> (Client, tokio::task::JoinHandle<()>) {
+    connect_with(Some(FrictionConfig {
+        repo: "example/steg".into(),
+        gh: Some(std::path::PathBuf::from("/nonexistent/gh")),
+        local_dir: std::env::temp_dir().join("steg-tests-unused"),
+    }))
+    .await
+}
+
+async fn connect_with(friction: Option<FrictionConfig>) -> (Client, tokio::task::JoinHandle<()>) {
     no_terminal_anywhere();
 
     let backend = Backend::new(
@@ -39,7 +48,7 @@ async fn connect() -> (Client, tokio::task::JoinHandle<()>) {
         },
         config::configuration(),
     );
-    let server = Steg::new(backend);
+    let server = Steg::new(backend, friction);
 
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
@@ -117,6 +126,7 @@ async fn tool_list_is_complete_and_documented() {
             "get_text",
             "kill_pane",
             "list_panes",
+            "report_friction",
             "send_key",
             "send_text",
             "set_tab_title",
@@ -308,7 +318,7 @@ async fn bad_arguments_are_rejected_before_touching_the_terminal() {
         Err(err) => assert!(format!("{err:#}").contains("pane_id"), "{err:#}"),
     }
     let still_alive = client.list_all_tools().await.expect("server still answers");
-    assert_eq!(still_alive.len(), 11);
+    assert_eq!(still_alive.len(), 12);
 
     client.cancel().await.expect("cancel");
     server.await.unwrap();
@@ -331,6 +341,265 @@ async fn unknown_resource_uris_are_not_found() {
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown resource"), "{uri}: {msg}");
     }
+
+    client.cancel().await.expect("cancel");
+    server.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// report_friction
+// ---------------------------------------------------------------------------
+
+/// A stand-in `gh` that records every `gh api` invocation and answers like
+/// GitHub's REST API would: `GET …/issues` returns the JSON in
+/// `issues.json`, `POST …/issues` and `POST …/comments` return objects with
+/// a `html_url`.  The log and issue paths are baked into the script so
+/// parallel tests never share state through the environment.
+#[cfg(unix)]
+struct FakeGh {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl FakeGh {
+    fn new(existing_issues: &str) -> FakeGh {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("issues.json"), existing_issues).unwrap();
+        let script = format!(
+            r#"#!/bin/bash
+# fake gh: only `gh api --method METHOD PATH [--input FILE]` is understood
+log="{dir}/calls.log"
+[ "$1" = "api" ] || {{ echo "fake gh: not an api call: $*" >&2; exit 1; }}
+method="$3"; path="$4"; input=""
+[ "$5" = "--input" ] && input="$6"
+echo "$method $path" >> "$log"
+case "$method $path" in
+  "GET repos/example/steg/issues?"*) cat "{dir}/issues.json" ;;
+  "POST repos/example/steg/issues")
+    cp "$input" "{dir}/create-input.json"
+    echo '{{"number": 42, "html_url": "https://github.com/example/steg/issues/42"}}' ;;
+  "POST repos/example/steg/issues/"*"/comments")
+    cp "$input" "{dir}/comment-input.json"
+    echo '{{"html_url": "https://github.com/example/steg/issues/7#issuecomment-1"}}' ;;
+  "POST repos/example/steg/labels")
+    echo '{{"message": "Validation Failed", "errors": [{{"code": "already_exists"}}]}}' >&2; exit 1 ;;
+  *) echo "fake gh: unexpected $method $path" >&2; exit 1 ;;
+esac
+"#,
+            dir = dir.path().display()
+        );
+        let path = dir.path().join("gh");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        FakeGh { dir }
+    }
+
+    fn config(&self) -> FrictionConfig {
+        FrictionConfig {
+            repo: "example/steg".into(),
+            gh: Some(self.dir.path().join("gh")),
+            local_dir: self.dir.path().join("local"),
+        }
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("calls.log")).unwrap_or_default()
+    }
+
+    /// The JSON body sent with `POST …/issues` ("create") or
+    /// `POST …/comments` ("comment").
+    fn input(&self, which: &str) -> Value {
+        let raw = std::fs::read_to_string(self.dir.path().join(format!("{which}-input.json")))
+            .unwrap_or_else(|_| "null".into());
+        serde_json::from_str(&raw).unwrap()
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn friction_report_becomes_a_labelled_issue_with_context() {
+    let gh = FakeGh::new("[]");
+    let (client, server) = connect_with(Some(gh.config())).await;
+
+    // Build up some history first: a failing call the report should mention.
+    let failed = call(&client, "get_text", json!({ "pane_id": 3 })).await;
+    assert_eq!(failed.is_error, Some(true));
+
+    let result = call(
+        &client,
+        "report_friction",
+        json!({
+            "title": "get_text fails when WezTerm is closed",
+            "details": "I called get_text and got told to start WezTerm, but I wanted the last screen.",
+            "category": "missing-capability",
+            "tool": "get_text",
+            "expected": "A cached copy of the last screen",
+            "pane_id": 3
+        }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let outcome = result
+        .structured_content
+        .clone()
+        .expect("structured outcome");
+    assert_eq!(outcome["outcome"], json!("created"), "{outcome:#?}");
+    assert_eq!(
+        outcome["url"],
+        json!("https://github.com/example/steg/issues/42")
+    );
+    assert_eq!(outcome["number"], json!(42));
+
+    let calls = gh.calls();
+    assert!(calls.contains("POST repos/example/steg/labels"), "{calls}");
+    assert!(
+        calls.contains("GET repos/example/steg/issues?state=open&labels=friction"),
+        "{calls}"
+    );
+    assert!(
+        calls.contains("POST repos/example/steg/issues\n"),
+        "{calls}"
+    );
+
+    let created = gh.input("create");
+    assert_eq!(
+        created["title"],
+        json!("get_text fails when WezTerm is closed")
+    );
+    assert_eq!(created["labels"], json!(["friction", "missing-capability"]));
+    let body = created["body"].as_str().expect("body").to_string();
+    for needle in [
+        "## What happened",
+        "I wanted the last screen",
+        "## Expected",
+        "A cached copy of the last screen",
+        "Category: `missing-capability`",
+        "Tool: `get_text`",
+        "## Recent tool calls",
+        "| `get_text` | pane_id=3 | **no** |",
+        "WezTerm", // the recorded error note
+        "Screen of pane 3 when reported",
+        "could not read pane 3", // no terminal, so the screen is an explanation
+    ] {
+        assert!(body.contains(needle), "missing {needle:?} in body:\n{body}");
+    }
+    assert!(
+        !body.contains("report_friction |"),
+        "the report call itself is not part of the history"
+    );
+
+    client.cancel().await.expect("cancel");
+    server.await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn duplicate_friction_titles_become_comments() {
+    let gh = FakeGh::new(
+        r#"[{"number": 7, "title": "Wait_for_idle returns early!", "html_url": "https://github.com/example/steg/issues/7"}]"#,
+    );
+    let (client, server) = connect_with(Some(gh.config())).await;
+
+    let result = call(
+        &client,
+        "report_friction",
+        json!({
+            "title": "wait_for_idle   returns early",
+            "details": "Second sighting, with Claude Code this time."
+        }),
+    )
+    .await;
+    let outcome = result
+        .structured_content
+        .clone()
+        .expect("structured outcome");
+    assert_eq!(outcome["outcome"], json!("commented"), "{outcome:#?}");
+    assert_eq!(outcome["number"], json!(7));
+    assert_eq!(
+        outcome["url"],
+        json!("https://github.com/example/steg/issues/7")
+    );
+
+    let calls = gh.calls();
+    assert!(
+        calls.contains("POST repos/example/steg/issues/7/comments"),
+        "{calls}"
+    );
+    assert!(
+        !calls.contains("POST repos/example/steg/issues\n"),
+        "no duplicate issue: {calls}"
+    );
+    assert!(gh.input("comment")["body"]
+        .as_str()
+        .unwrap()
+        .contains("Second sighting"));
+
+    client.cancel().await.expect("cancel");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn friction_falls_back_to_a_local_file_without_gh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (client, server) = connect_with(Some(FrictionConfig {
+        repo: "example/steg".into(),
+        gh: Some(dir.path().join("definitely-not-gh")),
+        local_dir: dir.path().join("friction"),
+    }))
+    .await;
+
+    let result = call(
+        &client,
+        "report_friction",
+        json!({ "title": "No gh here", "details": "Offline laptop.", "category": "bug" }),
+    )
+    .await;
+    assert_ne!(result.is_error, Some(true), "{}", text_of(&result));
+    let outcome = result
+        .structured_content
+        .clone()
+        .expect("structured outcome");
+    assert_eq!(outcome["outcome"], json!("saved_locally"), "{outcome:#?}");
+    let note = outcome["note"].as_str().unwrap();
+    assert!(
+        note.contains("gh") && note.contains("example/steg"),
+        "{note}"
+    );
+
+    let path = std::path::PathBuf::from(outcome["path"].as_str().expect("path"));
+    assert!(
+        path.starts_with(dir.path().join("friction")),
+        "{}",
+        path.display()
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.starts_with("# No gh here"), "{saved}");
+    assert!(saved.contains("Offline laptop."), "{saved}");
+    assert!(saved.contains("Category: `bug`"), "{saved}");
+
+    client.cancel().await.expect("cancel");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn friction_can_be_switched_off() {
+    let (client, server) = connect_with(None).await;
+
+    let tools = client.list_all_tools().await.expect("tools/list");
+    assert!(
+        !tools.iter().any(|t| t.name == "report_friction"),
+        "report_friction should be gone with --no-friction"
+    );
+    assert_eq!(tools.len(), 11);
+
+    let outcome = client
+        .call_tool(
+            CallToolRequestParams::new("report_friction")
+                .with_arguments(args(json!({ "title": "x", "details": "y" }))),
+        )
+        .await;
+    assert!(outcome.is_err(), "a disabled tool is not callable");
 
     client.cancel().await.expect("cancel");
     server.await.unwrap();

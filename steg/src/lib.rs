@@ -12,8 +12,10 @@
 //! transport.
 
 pub mod backend;
+pub mod friction;
 pub mod keys;
 pub mod server;
 
 pub use backend::{Backend, ConnectOptions};
+pub use friction::FrictionConfig;
 pub use server::Steg;
