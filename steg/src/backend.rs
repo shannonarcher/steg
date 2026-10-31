@@ -446,10 +446,14 @@ impl Backend {
         end: StableRowIndex,
         escapes: bool,
     ) -> anyhow::Result<String> {
+        // GetLines accepts several row ranges; we want exactly one, and we
+        // mean a Vec holding the range, not the rows it spans.
+        #[allow(clippy::single_range_in_vec_init)]
+        let ranges = vec![start..end + 1];
         let lines = client
             .get_lines(GetLines {
                 pane_id,
-                lines: vec![start..end + 1],
+                lines: ranges,
             })
             .await?;
 

@@ -1,28 +1,16 @@
-//! Steg: a Model Context Protocol (MCP) server for the WezTerm multiplexer.
-//!
-//! Steg connects to the running WezTerm GUI (or a background mux server)
-//! exactly the way `wezterm cli` does, and exposes windows, tabs and panes
-//! as MCP tools and resources.  An AI agent connected over stdio can then
-//! spawn tabs, type into them, press keys, wait for a program to settle
-//! and read what is on screen — in the very same window the human is
-//! looking at.
+//! The `steg` binary: CLI flags, wezterm bootstrap, tokio runtime and the
+//! stdio MCP transport.  All the behaviour lives in the `steg` library.
 //!
 //! The MCP protocol runs over stdin/stdout, so nothing in this binary may
 //! ever print to stdout.  Logging goes to stderr via the regular wezterm
 //! logger (`WEZTERM_LOG=steg=debug` to turn it up).
-
-mod backend;
-mod keys;
-mod server;
 
 use anyhow::Context;
 use clap::{Parser, ValueHint};
 use config::wezterm_version;
 use rmcp::ServiceExt;
 use std::ffi::OsString;
-
-use crate::backend::{Backend, ConnectOptions};
-use crate::server::Steg;
+use steg::{Backend, ConnectOptions, Steg};
 
 #[derive(Debug, Parser)]
 #[command(

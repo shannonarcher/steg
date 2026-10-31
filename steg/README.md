@@ -52,7 +52,7 @@ Tools:
 
 | tool | what it does |
 |---|---|
-| `list_panes` | every pane with window, tab, title, size, cwd, active flag |
+| `list_panes` | `{panes: [...]}`: every pane with window, tab, title, size, cwd, active flag |
 | `spawn_tab` | new tab (or window) running a shell or a command; returns pane_id |
 | `split_pane` | split a pane left/right/top/bottom; returns pane_id |
 | `send_text` | type text; `enter: true` presses Enter; `paste: true` pastes |
@@ -70,13 +70,38 @@ The server's `instructions` describe the intended flow
 (`spawn_tab` → `send_text` → `wait_for_idle` → `get_text`), so a capable
 agent needs no further prompting.
 
+Every failure the agent can act on (no terminal running, unknown pane, bad
+key name, invalid side) comes back as a tool result with `isError: true`
+and a plain-language message, so it reaches the model as text in any
+client. Only resource reads use protocol-level errors, because MCP gives
+them no other channel.
+
+## Tests
+
+```sh
+cargo build -p wezterm-mux-server   # optional: enables the end-to-end tests
+cargo test -p steg
+```
+
+Unit tests cover key and URI parsing. `tests/mcp_surface.rs` drives the
+server through a real MCP client in-process, with no terminal present, and
+pins down the handshake, tool schemas, resources and error texts.
+`tests/e2e_mux.rs` runs the built `steg` binary against a headless
+`wezterm-mux-server` over the real mux protocol — the same path as the GUI —
+and exercises every tool against a live bash. See `QA.md` for the manual
+checklist against a real window.
+
 ## Layout
 
 ```
-steg/src/main.rs     CLI flags, bootstrap, tokio runtime, stdio transport
-steg/src/server.rs   MCP tools, resources, instructions (rmcp)
-steg/src/backend.rs  the wezterm codec: everything `wezterm cli` can do, as async fns
-steg/src/keys.rs     "CTRL|c", "Escape", "F5" → key events
+steg/src/main.rs        CLI flags, bootstrap, tokio runtime, stdio transport
+steg/src/lib.rs         the library the binary and the tests share
+steg/src/server.rs      MCP tools, resources, instructions (rmcp)
+steg/src/backend.rs     the wezterm codec: everything `wezterm cli` can do, as async fns
+steg/src/keys.rs        "CTRL|c", "Escape", "F5" → key events
+steg/tests/mcp_surface.rs   MCP client ↔ server in-process, no terminal
+steg/tests/e2e_mux.rs       the binary against a headless wezterm-mux-server
+steg/QA.md              automated layers + manual checklist for the GUI
 ```
 
 `backend.rs` mirrors `wezterm/src/cli/*.rs` on purpose: when the CLI gains a

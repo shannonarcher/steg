@@ -19,7 +19,7 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,8 +48,22 @@ pub struct Steg {
     tool_router: ToolRouter<Self>,
 }
 
+/// Errors from resource reads have to be protocol errors; MCP gives them no
+/// other channel.
 fn mcp_err(err: anyhow::Error) -> McpError {
     McpError::internal_error(format!("{err:#}"), None)
+}
+
+/// Tools report every failure the agent can act on — no terminal running,
+/// unknown pane, bad key name — as a tool result with `isError: true`, so
+/// the message reaches the model as text in every client.  (A malformed
+/// request that doesn't match the input schema is still rejected by rmcp
+/// as a JSON-RPC invalid-params error before we see it.)  Returning
+/// `Result<_, String>` is what makes rmcp do that; the `Result<Json<T>, _>`
+/// shape must be spelled out literally for the macro to derive an output
+/// schema from it.
+fn tool_err(err: anyhow::Error) -> String {
+    format!("{err:#}")
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +181,13 @@ pub struct SetTabTitleParams {
     pub title: String,
 }
 
+/// `list_panes` result. MCP structured content must be an object, so the
+/// array is wrapped.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct PaneList {
+    pub panes: Vec<PaneInfo>,
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
@@ -183,8 +204,12 @@ impl Steg {
     #[tool(
         description = "List every pane in the running WezTerm, with its window, tab, title, size, cwd and whether it is the active pane of its tab."
     )]
-    async fn list_panes(&self) -> Result<Json<Vec<PaneInfo>>, McpError> {
-        self.backend.list_panes().await.map(Json).map_err(mcp_err)
+    async fn list_panes(&self) -> Result<Json<PaneList>, String> {
+        self.backend
+            .list_panes()
+            .await
+            .map(|panes| Json(PaneList { panes }))
+            .map_err(tool_err)
     }
 
     #[tool(
@@ -193,7 +218,7 @@ impl Steg {
     async fn spawn_tab(
         &self,
         Parameters(p): Parameters<SpawnTabParams>,
-    ) -> Result<Json<Spawned>, McpError> {
+    ) -> Result<Json<Spawned>, String> {
         self.backend
             .spawn_tab(SpawnTab {
                 cwd: p.cwd,
@@ -206,7 +231,7 @@ impl Steg {
             })
             .await
             .map(Json)
-            .map_err(mcp_err)
+            .map_err(tool_err)
     }
 
     #[tool(
@@ -215,16 +240,15 @@ impl Steg {
     async fn split_pane(
         &self,
         Parameters(p): Parameters<SplitPaneParams>,
-    ) -> Result<Json<Spawned>, McpError> {
+    ) -> Result<Json<Spawned>, String> {
         let side = match p.side.as_deref().map(str::to_ascii_lowercase).as_deref() {
             None | Some("bottom") | Some("down") => SplitSide::Bottom,
             Some("top") | Some("up") => SplitSide::Top,
             Some("left") => SplitSide::Left,
             Some("right") => SplitSide::Right,
             Some(other) => {
-                return Err(McpError::invalid_params(
-                    format!("side must be left, right, top or bottom, not {other:?}"),
-                    None,
+                return Err(format!(
+                    "side must be left, right, top or bottom, not {other:?}"
                 ))
             }
         };
@@ -239,25 +263,22 @@ impl Steg {
             })
             .await
             .map(Json)
-            .map_err(mcp_err)
+            .map_err(tool_err)
     }
 
     #[tool(
         description = "Type text into a pane as keystrokes (or as a paste). Set enter=true to press Enter afterwards. Nothing is added to the text otherwise."
     )]
-    async fn send_text(
-        &self,
-        Parameters(p): Parameters<SendTextParams>,
-    ) -> Result<String, McpError> {
+    async fn send_text(&self, Parameters(p): Parameters<SendTextParams>) -> Result<String, String> {
         self.backend
             .send_text(p.pane_id, &p.text, p.paste)
             .await
-            .map_err(mcp_err)?;
+            .map_err(tool_err)?;
         if p.enter {
             self.backend
                 .send_text(p.pane_id, "\r", false)
                 .await
-                .map_err(mcp_err)?;
+                .map_err(tool_err)?;
         }
         Ok(format!(
             "sent {} bytes to pane {}{}",
@@ -270,15 +291,14 @@ impl Steg {
     #[tool(
         description = "Press a key in a pane, with optional modifiers. For control keys and chords: Escape, Enter, Up/Down, Shift+Tab (key=\"Tab\", mods=\"SHIFT\"), Ctrl-C (key=\"c\", mods=\"CTRL\")."
     )]
-    async fn send_key(&self, Parameters(p): Parameters<SendKeyParams>) -> Result<String, McpError> {
-        let event = parse_key_event(&p.key, p.mods.as_deref())
-            .map_err(|e| McpError::invalid_params(format!("{e:#}"), None))?;
+    async fn send_key(&self, Parameters(p): Parameters<SendKeyParams>) -> Result<String, String> {
+        let event = parse_key_event(&p.key, p.mods.as_deref()).map_err(|e| format!("{e:#}"))?;
         let repeat = p.repeat.unwrap_or(1).clamp(1, 100);
         for _ in 0..repeat {
             self.backend
                 .send_key(p.pane_id, event.clone())
                 .await
-                .map_err(mcp_err)?;
+                .map_err(tool_err)?;
         }
         Ok(format!(
             "pressed {}{} x{} in pane {}",
@@ -295,11 +315,11 @@ impl Steg {
     #[tool(
         description = "Read the text of a pane: the visible screen by default, or a line range reaching into the scrollback with negative start_line. Trailing blank lines are dropped."
     )]
-    async fn get_text(&self, Parameters(p): Parameters<GetTextParams>) -> Result<String, McpError> {
+    async fn get_text(&self, Parameters(p): Parameters<GetTextParams>) -> Result<String, String> {
         self.backend
             .get_text(p.pane_id, p.start_line, p.end_line, p.escapes)
             .await
-            .map_err(mcp_err)
+            .map_err(tool_err)
     }
 
     #[tool(
@@ -308,7 +328,7 @@ impl Steg {
     async fn wait_for_idle(
         &self,
         Parameters(p): Parameters<WaitForIdleParams>,
-    ) -> Result<Json<IdleResult>, McpError> {
+    ) -> Result<Json<IdleResult>, String> {
         let quiet = Duration::from_millis(p.quiet_ms.unwrap_or(1500).clamp(100, 60_000));
         let timeout = Duration::from_millis(p.timeout_ms.unwrap_or(120_000).clamp(100, 3_600_000));
         let poll = Duration::from_millis(250);
@@ -316,27 +336,27 @@ impl Steg {
             .wait_for_idle(p.pane_id, quiet, timeout, poll)
             .await
             .map(Json)
-            .map_err(mcp_err)
+            .map_err(tool_err)
     }
 
     #[tool(description = "Focus a pane, bringing its tab to the front in the human's window.")]
     async fn activate_pane(
         &self,
         Parameters(p): Parameters<PaneIdParams>,
-    ) -> Result<String, McpError> {
+    ) -> Result<String, String> {
         self.backend
             .activate_pane(p.pane_id)
             .await
-            .map_err(mcp_err)?;
+            .map_err(tool_err)?;
         Ok(format!("pane {} is now focused", p.pane_id))
     }
 
     #[tool(description = "Bring a tab to the front by tab_id.")]
-    async fn activate_tab(
-        &self,
-        Parameters(p): Parameters<TabIdParams>,
-    ) -> Result<String, McpError> {
-        self.backend.activate_tab(p.tab_id).await.map_err(mcp_err)?;
+    async fn activate_tab(&self, Parameters(p): Parameters<TabIdParams>) -> Result<String, String> {
+        self.backend
+            .activate_tab(p.tab_id)
+            .await
+            .map_err(tool_err)?;
         Ok(format!("tab {} is now active", p.tab_id))
     }
 
@@ -344,29 +364,24 @@ impl Steg {
     async fn set_tab_title(
         &self,
         Parameters(p): Parameters<SetTabTitleParams>,
-    ) -> Result<String, McpError> {
+    ) -> Result<String, String> {
         let tab_id = match (p.tab_id, p.pane_id) {
             (Some(tab_id), _) => tab_id,
-            (None, Some(pane_id)) => self.backend.tab_for_pane(pane_id).await.map_err(mcp_err)?,
-            (None, None) => {
-                return Err(McpError::invalid_params(
-                    "give either tab_id or pane_id",
-                    None,
-                ))
-            }
+            (None, Some(pane_id)) => self.backend.tab_for_pane(pane_id).await.map_err(tool_err)?,
+            (None, None) => return Err("give either tab_id or pane_id".to_string()),
         };
         self.backend
             .set_tab_title(tab_id, p.title.clone())
             .await
-            .map_err(mcp_err)?;
+            .map_err(tool_err)?;
         Ok(format!("tab {tab_id} renamed to {:?}", p.title))
     }
 
     #[tool(
         description = "Close a pane, killing whatever runs in it. Closing the last pane of a tab closes the tab."
     )]
-    async fn kill_pane(&self, Parameters(p): Parameters<PaneIdParams>) -> Result<String, McpError> {
-        self.backend.kill_pane(p.pane_id).await.map_err(mcp_err)?;
+    async fn kill_pane(&self, Parameters(p): Parameters<PaneIdParams>) -> Result<String, String> {
+        self.backend.kill_pane(p.pane_id).await.map_err(tool_err)?;
         Ok(format!("pane {} closed", p.pane_id))
     }
 }
@@ -390,7 +405,7 @@ fn parse_pane_uri(uri: &str) -> Option<(PaneId, &str)> {
     Some((id, what))
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Steg {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(
