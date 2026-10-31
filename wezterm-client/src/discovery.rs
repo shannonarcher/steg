@@ -230,9 +230,8 @@ mod windows {
                 let path = std::str::from_utf8(&source_slice[0..len])
                     .context("reading path from shared memory")?;
 
-                let path: PathBuf = path.into();
-
-                Ok(path)
+                // Only the file name is published; see NameHolder::new
+                Ok(config::RUNTIME_DIR.join(path))
             })
         }
     }

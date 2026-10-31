@@ -11,6 +11,7 @@ members = [
   "wezterm-escape-parser",
   "wezterm-dynamic",
   "wezterm-gui",
+  "steg",
   "wezterm-mux-server",
   "wezterm-open-url",
   "wezterm-ssh",
