@@ -1,0 +1,71 @@
+name: steg_release
+
+# Hand-written, unlike the gen_*.yml files from ci/generate-workflows.py.
+# Steg must match the mux protocol version of the WezTerm it talks to, so the
+# release zip carries both, built from the same commit.
+
+on:
+  push:
+    tags:
+      - "steg-v*"
+
+jobs:
+  windows:
+    runs-on: "windows-2025"
+    timeout-minutes: 120
+    permissions:
+      contents: write
+
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      RUSTUP_WINDOWS_PATH_ADD_BIN: "1"
+      TAG_NAME: ${{ github.ref_name }}
+
+    steps:
+      - name: "checkout repo"
+        uses: actions/checkout@v5
+        with:
+          submodules: "recursive"
+      - name: "Install Rust"
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: "x86_64-pc-windows-msvc"
+      - name: "Compile with sccache"
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: "Build (Release mode)"
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --release -p steg -p wezterm -p wezterm-gui -p wezterm-mux-server
+      - name: "Test steg"
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo test --release -p steg
+      - name: "Package"
+        shell: bash
+        run: |
+          zipdir="Steg-windows-$TAG_NAME"
+          mkdir "$zipdir" "$zipdir/mesa"
+          cp target/release/steg.exe \
+            target/release/wezterm.exe \
+            target/release/wezterm-gui.exe \
+            target/release/wezterm-mux-server.exe \
+            assets/windows/conhost/conpty.dll \
+            assets/windows/conhost/OpenConsole.exe \
+            assets/windows/angle/libEGL.dll \
+            assets/windows/angle/libGLESv2.dll \
+            "$zipdir"
+          cp target/release/mesa/opengl32.dll "$zipdir/mesa"
+          7z a -tzip "$zipdir.zip" "$zipdir"
+          sha256sum "$zipdir.zip" > "$zipdir.zip.sha256"
+      - name: "Publish pre-release"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create "$TAG_NAME" Steg-windows-*.zip Steg-windows-*.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" --prerelease --title "Steg $TAG_NAME" \
+            --notes "Steg MCP server with the matching WezTerm build for Windows x64. Unsigned test build."
